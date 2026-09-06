@@ -1,12 +1,17 @@
 
 import streamlit as st
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import json, random, math
+
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
 
 # ============================================================
 # MY ONE — FINAL / PERSONAL LIFE OPERATING SYSTEM
-# Local-first • No cloud account required • JSON persistence
+# Cloud sync with Supabase + local JSON fallback
 # ============================================================
 
 st.set_page_config(
@@ -65,18 +70,115 @@ DEFAULT = {
 def deep_copy(x):
     return json.loads(json.dumps(x))
 
-def load_data():
+
+def merge_with_default(loaded):
+    base = deep_copy(DEFAULT)
+    if isinstance(loaded, dict):
+        for k, v in loaded.items():
+            base[k] = v
+    return base
+
+
+def get_supabase():
+    if create_client is None:
+        return None
+    try:
+        url = st.secrets.get("SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_KEY")
+        if url and key:
+            return create_client(url, key)
+    except Exception:
+        pass
+    return None
+
+
+supabase = get_supabase()
+
+# ============================================================
+# CLOUD LOGIN
+# ============================================================
+if supabase is not None:
+    if "auth_user" not in st.session_state:
+        st.session_state.auth_user = None
+
+    # Reuse the Supabase client session if one exists.
+    if st.session_state.auth_user is None:
+        try:
+            user_resp = supabase.auth.get_user()
+            if getattr(user_resp, "user", None):
+                st.session_state.auth_user = user_resp.user
+        except Exception:
+            pass
+
+    if st.session_state.auth_user is None:
+        st.markdown("# 🔥 MY ONE")
+        st.caption("Your personal life operating system — secure cloud sync")
+        tab_login, tab_signup = st.tabs(["🔐 Login", "✨ Create account"])
+
+        with tab_login:
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            if st.button("🚀 Login to MY ONE", type="primary", use_container_width=True):
+                try:
+                    result = supabase.auth.sign_in_with_password({"email": email, "password": password})
+                    if getattr(result, "user", None):
+                        st.session_state.auth_user = result.user
+                        st.success("Login successful!")
+                        st.rerun()
+                    else:
+                        st.error("Login failed. Please check your email and password.")
+                except Exception as e:
+                    st.error(f"Login failed: {e}")
+
+        with tab_signup:
+            new_email = st.text_input("Email", key="signup_email")
+            new_password = st.text_input("Password", type="password", key="signup_password")
+            st.caption("Use at least 6 characters. If email confirmation is enabled in Supabase, confirm the email first.")
+            if st.button("✨ Create MY ONE account", use_container_width=True):
+                try:
+                    result = supabase.auth.sign_up({"email": new_email, "password": new_password})
+                    if getattr(result, "user", None) and getattr(result, "session", None):
+                        st.session_state.auth_user = result.user
+                        st.success("Account created!")
+                        st.rerun()
+                    else:
+                        st.success("Account created. Check your email if confirmation is required, then log in.")
+                except Exception as e:
+                    st.error(f"Sign-up failed: {e}")
+
+        st.stop()
+
+    USER_ID = str(st.session_state.auth_user.id)
+
+
+def load_local_data():
     if DATA_FILE.exists():
         try:
-            loaded = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-            base = deep_copy(DEFAULT)
-            # Keep new fields when opening an older MY ONE file.
-            for k, v in loaded.items():
-                base[k] = v
-            return base
+            return merge_with_default(json.loads(DATA_FILE.read_text(encoding="utf-8")))
         except Exception:
             pass
     return deep_copy(DEFAULT)
+
+
+def load_data():
+    if supabase is not None and st.session_state.get("auth_user") is not None:
+        try:
+            rows = (supabase.table("my_one_data")
+                    .select("data")
+                    .eq("user_id", USER_ID)
+                    .execute()).data
+            if rows:
+                return merge_with_default(rows[0].get("data", {}))
+            initial = deep_copy(DEFAULT)
+            supabase.table("my_one_data").insert({
+                "user_id": USER_ID,
+                "data": initial,
+            }).execute()
+            return initial
+        except Exception as e:
+            st.warning(f"Cloud data could not be loaded right now. Using local data. ({e})")
+    return load_local_data()
+
 
 if "data" not in st.session_state:
     st.session_state.data = load_data()
@@ -84,8 +186,20 @@ if "data" not in st.session_state:
 d = st.session_state.data
 TODAY = date.today().isoformat()
 
+
 def save():
+    # Always keep a local copy as an emergency backup.
     DATA_FILE.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+    if supabase is not None and st.session_state.get("auth_user") is not None:
+        try:
+            supabase.table("my_one_data").upsert({
+                "user_id": USER_ID,
+                "data": d,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception as e:
+            st.warning(f"Local save completed, but cloud save failed: {e}")
+
 
 def rerun():
     save()
@@ -565,7 +679,7 @@ elif nav == "📊 Life Analytics":
 # ============================================================
 elif nav == "⚙️ Settings":
     st.title("⚙️ Settings")
-    st.caption("Your data stays in your local MY ONE folder unless you export it.")
+    st.caption("Your MY ONE data syncs to Supabase cloud. A local backup is also kept.")
     p=d["profile"]
     name=st.text_input("Name",p["name"])
     why=st.text_input("My Why",p["why"])
@@ -591,18 +705,31 @@ elif nav == "⚙️ Settings":
 
     st.divider()
     st.subheader("🧹 Reset")
-    st.warning("Reset deletes your current local MY ONE data and returns to starter data.")
+    st.warning("Reset replaces your current MY ONE data with the starter data and saves the change to the cloud.")
     if st.button("Reset to starter data"):
         st.session_state.data=deep_copy(DEFAULT)
         save()
         st.success("MY ONE has been reset.")
         st.rerun()
 
+if supabase is not None and st.session_state.get("auth_user") is not None:
+    st.sidebar.divider()
+    st.sidebar.caption("☁️ Cloud sync: Connected")
+    st.sidebar.caption(st.session_state.auth_user.email)
+    if st.sidebar.button("🚪 Log out", use_container_width=True):
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
+        st.session_state.auth_user = None
+        st.session_state.pop("data", None)
+        st.rerun()
+
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center;color:#7d899e;font-size:12px;">'
     '🔥 MY ONE — Build the person who can build the life you want. '
-    'Local-first • Your data • Your system • Your future'
+    'Cloud sync • Your data • Your system • Your future'
     '</div>',
     unsafe_allow_html=True
 )
